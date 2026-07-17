@@ -595,8 +595,8 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 	log.Infof("Applying Relocations..")
 	associatedMaps := make(map[int]string)
 	for _, relocationEntry := range relocationEntries {
-		if relocationEntry.relOffset >= len(data) {
-			return nil, nil, fmt.Errorf("invalid offset for the relocation entry %d", relocationEntry.relOffset)
+		if relocationEntry.relOffset < 0 || relocationEntry.relOffset+bpfInsDefSize > len(data) {
+			return nil, nil, fmt.Errorf("invalid offset for the relocation entry %d (data len %d)", relocationEntry.relOffset, len(data))
 		}
 
 		//eBPF has one 16-byte instruction: BPF_LD | BPF_DW | BPF_IMM which consists
@@ -645,8 +645,9 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 			targetByteOffset := (ebpfInstruction.Imm + 1) * int32(bpfInsDefSize)
 			targetOffset := int32(progSectionSize) + int32(relocationEntry.symbol.Value) + targetByteOffset
 
-			// Guard against a corrupt addend producing an out-of-range target.
-			if targetOffset < 0 || int(targetOffset) >= len(data) {
+			// Guard against a corrupt addend producing an out-of-range target;
+			// the full target instruction (bpfInsDefSize bytes) must fit.
+			if targetOffset < 0 || int(targetOffset)+bpfInsDefSize > len(data) {
 				return nil, nil, fmt.Errorf("call relocation for %q computed out-of-bounds target offset %d (combined size %d)",
 					funcName, targetOffset, len(data))
 			}
@@ -704,10 +705,10 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 
 // countEntryPrograms returns the number of GLOBAL function symbols that live in
 // a program section (i.e. loadable entry programs, not .text subprograms).
-func (e *elfLoader) countEntryPrograms() int {
+func (e *elfLoader) countEntryPrograms() (int, error) {
 	symbolTable, err := e.elfFile.Symbols()
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("get symbols: %w", err)
 	}
 	count := 0
 	for _, symbol := range symbolTable {
@@ -718,7 +719,7 @@ func (e *elfLoader) countEntryPrograms() int {
 			count++
 		}
 	}
-	return count
+	return count, nil
 }
 
 func (e *elfLoader) parseProg(loadedMaps map[string]ebpf_maps.BpfMap) (map[string]ebpf_progs.CreateEBPFProgInput, error) {
@@ -745,7 +746,11 @@ func (e *elfLoader) parseProg(loadedMaps map[string]ebpf_maps.BpfMap) (map[strin
 		// requires extracting only each program's own call-graph subprograms and
 		// recomputing call offsets/map associations per program. Until then,
 		// fail loud rather than emit bytecode the kernel will reject.
-		if entryProgs := e.countEntryPrograms(); entryProgs > 1 {
+		entryProgs, err := e.countEntryPrograms()
+		if err != nil {
+			return nil, fmt.Errorf("failed to count entry programs: %w", err)
+		}
+		if entryProgs > 1 {
 			log.Errorf("ELF has %d entry programs and uses .text subprograms; this layout is not supported (would produce unreachable subprograms)", entryProgs)
 			return nil, fmt.Errorf("failed to Load the prog: multiple entry programs with .text subprograms is unsupported (appending all .text subprograms to each program creates unreachable instructions the kernel verifier rejects)")
 		}
